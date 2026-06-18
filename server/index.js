@@ -5,6 +5,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
 const { v4: uuidv4 } = require('uuid');
+const pgSession = require('connect-pg-simple')(session);
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -65,7 +66,12 @@ app.use(cors({
   credentials: true,
 }));
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'dev-secret-change-in-production',
+  store: new pgSession({
+    pool: pool,
+    tableName: 'session',
+    createTableIfMissing: true,
+  }),
+  secret: process.env.SESSION_SECRET || 'dev-secret',
   resave: false,
   saveUninitialized: false,
   cookie: {
@@ -73,7 +79,7 @@ app.use(session({
     httpOnly: true,
     maxAge: 24 * 60 * 60 * 1000,
     sameSite: 'none',
-},
+  },
 }));
 
 async function requireAuth(req, res, next) {
