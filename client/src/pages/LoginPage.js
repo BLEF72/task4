@@ -1,3 +1,4 @@
+// IMPORTANT: Login page — saves JWT token to localStorage on success
 import React, { useState, useEffect } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../App';
@@ -7,20 +8,15 @@ export default function LoginPage() {
   const { setCurrentUser } = useAuth();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [loading, setLoading] = useState(false);
 
-
   useEffect(() => {
-    if (searchParams.get('verified') === '1') {
-      setInfo('Email verified successfully! You can now log in.');
-    } else if (searchParams.get('error') === 'invalid_token') {
-      setError('Invalid or expired verification link.');
-    }
+    if (searchParams.get('verified') === '1') setInfo('Email verified! You can now log in.');
+    else if (searchParams.get('error') === 'invalid_token') setError('Invalid or expired verification link.');
   }, [searchParams]);
 
   const handleSubmit = async (e) => {
@@ -29,6 +25,8 @@ export default function LoginPage() {
     setLoading(true);
     try {
       const res = await api.post('/api/login', { email, password });
+      // IMPORTANT: Store JWT token in localStorage
+      localStorage.setItem('token', res.data.token);
       setCurrentUser(res.data.user);
       navigate('/dashboard', { replace: true });
     } catch (err) {
@@ -44,52 +42,25 @@ export default function LoginPage() {
         <div className="card-body p-4">
           <h1 className="h4 mb-1 fw-bold">Sign in</h1>
           <p className="text-muted small mb-4">User Management System</p>
-
           {info && <div className="alert alert-success py-2">{info}</div>}
           {error && <div className="alert alert-danger py-2">{error}</div>}
-
           <form onSubmit={handleSubmit} noValidate>
             <div className="mb-3">
               <label htmlFor="email" className="form-label">Email address</label>
-              <input
-                id="email"
-                type="email"
-                className="form-control"
-                placeholder="you@example.com"
-                value={email}
-                onChange={e => setEmail(e.target.value)}
-                required
-                autoFocus
-              />
+              <input id="email" type="email" className="form-control" placeholder="you@example.com"
+                value={email} onChange={e => setEmail(e.target.value)} required autoFocus />
             </div>
             <div className="mb-4">
               <label htmlFor="password" className="form-label">Password</label>
-              <input
-                id="password"
-                type="password"
-                className="form-control"
-                placeholder="Your password"
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                required
-              />
+              <input id="password" type="password" className="form-control" placeholder="Your password"
+                value={password} onChange={e => setPassword(e.target.value)} required />
             </div>
-            <button
-              type="submit"
-              className="btn btn-primary w-100"
-              disabled={loading}
-            >
-              {loading
-                ? <><span className="spinner-border spinner-border-sm me-2" />Signing in…</>
-                : 'Sign in'}
+            <button type="submit" className="btn btn-primary w-100" disabled={loading}>
+              {loading ? <><span className="spinner-border spinner-border-sm me-2" />Signing in…</> : 'Sign in'}
             </button>
           </form>
-
           <hr className="my-3" />
-          <p className="text-center mb-0 small">
-            Don't have an account?{' '}
-            <Link to="/register">Create one</Link>
-          </p>
+          <p className="text-center mb-0 small">Don't have an account? <Link to="/register">Create one</Link></p>
         </div>
       </div>
     </div>

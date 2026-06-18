@@ -1,22 +1,23 @@
+// IMPORTANT: Main server — JWT-based auth (no session store needed)
 const express = require('express');
-const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
 const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
 const { v4: uuidv4 } = require('uuid');
-const pgSession = require('connect-pg-simple')(session);
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.SESSION_SECRET || 'dev-secret';
 
-
+// IMPORTANT: PostgreSQL connection pool
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-
+// IMPORTANT: Initialize database schema on startup
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -29,14 +30,13 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       verification_token VARCHAR(255)
     );
-    -- NOTA BENE: This unique index is the database-level guarantee of email uniqueness.
-    -- It is NOT a primary key — it is a separate unique index on the email column.
-    -- This ensures consistency regardless of how many sources push data simultaneously.
+    -- NOTA BENE: Unique index — database-level email uniqueness guarantee
     CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique_idx ON users (email);
   `);
   console.log('Database initialized with unique index on email');
 }
 
+// NOTE: Nodemailer — Gmail SMTP
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
@@ -45,7 +45,7 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-
+// NOTE: Fire-and-forget email — registration never blocks on this
 function sendVerificationEmailAsync(email, name, token) {
   const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
   const link = `${baseUrl}/api/verify?token=${token}`;
@@ -53,59 +53,41 @@ function sendVerificationEmailAsync(email, name, token) {
     from: process.env.EMAIL_USER,
     to: email,
     subject: 'Verify your email',
-    html: `<p>Hello ${name},</p>
-           <p>Click <a href="${link}">here</a> to verify your email address.</p>
-           <p>If you did not register, ignore this email.</p>`,
-  }).catch(err => console.error('Email send error (non-critical):', err));
+    html: `<p>Hello ${name},</p><p>Click <a href="${link}">here</a> to verify your email.</p>`,
+  }).catch(err => console.error('Email error (non-critical):', err));
 }
-
 
 app.use(express.json());
 app.use(cors({
   origin: true,
   credentials: true,
 }));
-app.use(session({
-  store: new pgSession({
-    pool: pool,
-    tableName: 'session',
-    createTableIfMissing: true,
-  }),
-  secret: process.env.SESSION_SECRET || 'dev-secret',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: true,
-    httpOnly: true,
-    maxAge: 24 * 60 * 60 * 1000,
-    sameSite: 'none',
-  },
-}));
 
+// IMPORTANT: JWT auth middleware — checks token from Authorization header
 async function requireAuth(req, res, next) {
-  if (!req.session.userId) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
+  if (!token) {
     return res.status(401).json({ error: 'Not authenticated' });
   }
   try {
-    const result = await pool.query('SELECT id, status FROM users WHERE id = $1', [req.session.userId]);
+    const decoded = jwt.verify(token, JWT_SECRET);
+    // NOTE: Check user still exists and is not blocked on every request
+    const result = await pool.query('SELECT id, status FROM users WHERE id = $1', [decoded.userId]);
     if (result.rows.length === 0) {
-     
-      req.session.destroy(() => {});
       return res.status(401).json({ error: 'User not found', redirect: true });
     }
-    const user = result.rows[0];
-    if (user.status === 'blocked') {
-     
-      req.session.destroy(() => {});
+    if (result.rows[0].status === 'blocked') {
       return res.status(401).json({ error: 'Account is blocked', redirect: true });
     }
-    req.currentUser = user;
+    req.currentUser = result.rows[0];
     next();
   } catch (err) {
-    console.error('Auth middleware error:', err);
-    res.status(500).json({ error: 'Server error' });
+    return res.status(401).json({ error: 'Invalid token', redirect: true });
   }
 }
+
+// ── AUTH ROUTES ───────────────────────────────────────────────────────────────
 
 app.post('/api/register', async (req, res) => {
   const { name, email, password } = req.body;
@@ -115,21 +97,20 @@ app.post('/api/register', async (req, res) => {
   try {
     const passwordHash = await bcrypt.hash(password, 10);
     const token = uuidv4();
+    // IMPORTANT: No code check for duplicate email — unique index handles it
     const result = await pool.query(
       `INSERT INTO users (name, email, password_hash, status, verification_token, created_at)
        VALUES ($1, $2, $3, 'unverified', $4, NOW())
        RETURNING id, name, email, status`,
       [name.trim(), email.toLowerCase().trim(), passwordHash, token]
     );
-    const newUser = result.rows[0];
-    
-    sendVerificationEmailAsync(newUser.email, newUser.name, token);
+    sendVerificationEmailAsync(result.rows[0].email, result.rows[0].name, token);
     res.status(201).json({
       message: 'Registration successful! Check your email to verify your account.',
-      user: newUser,
+      user: result.rows[0],
     });
   } catch (err) {
-  
+    // NOTA BENE: PostgreSQL unique constraint violation code
     if (err.code === '23505') {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
@@ -137,7 +118,6 @@ app.post('/api/register', async (req, res) => {
     res.status(500).json({ error: 'Registration failed. Please try again.' });
   }
 });
-
 
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
@@ -157,17 +137,12 @@ app.post('/api/login', async (req, res) => {
     if (!valid) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
-
     await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
-    req.session.userId = user.id;
+    // NOTE: Sign JWT with 24h expiry
+    const jwtToken = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '24h' });
     res.json({
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        status: user.status,
-        last_login: new Date().toISOString(),
-      },
+      token: jwtToken,
+      user: { id: user.id, name: user.name, email: user.email, status: user.status, last_login: new Date().toISOString() },
     });
   } catch (err) {
     console.error('Login error:', err);
@@ -176,132 +151,68 @@ app.post('/api/login', async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-  req.session.destroy(() => {
-    res.json({ message: 'Logged out successfully' });
-  });
+  // NOTE: JWT is stateless — logout is handled client-side by deleting the token
+  res.json({ message: 'Logged out successfully' });
 });
 
 app.get('/api/verify', async (req, res) => {
   const { token } = req.query;
-  if (!token) {
-    return res.redirect((process.env.CLIENT_URL || 'http://localhost:3000') + '/login?error=invalid_token');
-  }
+  if (!token) return res.redirect((process.env.CLIENT_URL || 'http://localhost:3000') + '/login?error=invalid_token');
   try {
     const result = await pool.query(
-      `UPDATE users
-       SET status = CASE WHEN status = 'unverified' THEN 'active' ELSE status END,
-           verification_token = NULL
-       WHERE verification_token = $1
-       RETURNING id`,
+      `UPDATE users SET status = CASE WHEN status = 'unverified' THEN 'active' ELSE status END, verification_token = NULL
+       WHERE verification_token = $1 RETURNING id`,
       [token]
     );
-    if (result.rows.length === 0) {
-      return res.redirect((process.env.CLIENT_URL || 'http://localhost:3000') + '/login?error=invalid_token');
-    }
+    if (result.rows.length === 0) return res.redirect((process.env.CLIENT_URL || 'http://localhost:3000') + '/login?error=invalid_token');
     res.redirect((process.env.CLIENT_URL || 'http://localhost:3000') + '/login?verified=1');
   } catch (err) {
-    console.error('Verify error:', err);
     res.redirect((process.env.CLIENT_URL || 'http://localhost:3000') + '/login?error=server_error');
   }
 });
 
-
 app.get('/api/me', requireAuth, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT id, name, email, status, last_login, created_at FROM users WHERE id = $1',
-      [req.session.userId]
-    );
-    res.json({ user: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
+  const result = await pool.query('SELECT id, name, email, status, last_login, created_at FROM users WHERE id = $1', [req.currentUser.id]);
+  res.json({ user: result.rows[0] });
 });
 
+// ── USER MANAGEMENT ROUTES ────────────────────────────────────────────────────
+
+// IMPORTANT: getUniqIdValue — returns unique id for a user row
+function getUniqIdValue(user) { return user.id; }
 
 app.get('/api/users', requireAuth, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, name, email, status, last_login, created_at
-       FROM users
-       ORDER BY last_login DESC NULLS LAST, created_at DESC`
-    );
-    res.json({ users: result.rows });
-  } catch (err) {
-    console.error('Get users error:', err);
-    res.status(500).json({ error: 'Failed to fetch users' });
-  }
+  const result = await pool.query(`SELECT id, name, email, status, last_login, created_at FROM users ORDER BY last_login DESC NULLS LAST, created_at DESC`);
+  res.json({ users: result.rows });
 });
-
-
-function getUniqIdValue(user) {
-  return user.id;
-}
 
 app.post('/api/users/block', requireAuth, async (req, res) => {
   const { ids } = req.body;
-  if (!Array.isArray(ids) || ids.length === 0) {
-    return res.status(400).json({ error: 'No users selected' });
-  }
-  try {
-    await pool.query(
-      `UPDATE users SET status = 'blocked' WHERE id = ANY($1::int[]) AND status != 'blocked'`,
-      [ids]
-    );
-    res.json({ message: `${ids.length} user(s) blocked successfully` });
-  } catch (err) {
-    console.error('Block error:', err);
-    res.status(500).json({ error: 'Failed to block users' });
-  }
+  if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'No users selected' });
+  await pool.query(`UPDATE users SET status = 'blocked' WHERE id = ANY($1::int[])`, [ids]);
+  res.json({ message: `${ids.length} user(s) blocked successfully` });
 });
 
 app.post('/api/users/unblock', requireAuth, async (req, res) => {
   const { ids } = req.body;
-  if (!Array.isArray(ids) || ids.length === 0) {
-    return res.status(400).json({ error: 'No users selected' });
-  }
-  try {
-    await pool.query(
-      `UPDATE users SET status = 'active' WHERE id = ANY($1::int[]) AND status = 'blocked'`,
-      [ids]
-    );
-    res.json({ message: `${ids.length} user(s) unblocked successfully` });
-  } catch (err) {
-    console.error('Unblock error:', err);
-    res.status(500).json({ error: 'Failed to unblock users' });
-  }
+  if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'No users selected' });
+  await pool.query(`UPDATE users SET status = 'active' WHERE id = ANY($1::int[]) AND status = 'blocked'`, [ids]);
+  res.json({ message: `${ids.length} user(s) unblocked successfully` });
 });
-
 
 app.delete('/api/users', requireAuth, async (req, res) => {
   const { ids } = req.body;
-  if (!Array.isArray(ids) || ids.length === 0) {
-    return res.status(400).json({ error: 'No users selected' });
-  }
-  try {
-    
-    await pool.query('DELETE FROM users WHERE id = ANY($1::int[])', [ids]);
-    res.json({ message: `${ids.length} user(s) deleted successfully` });
-  } catch (err) {
-    console.error('Delete error:', err);
-    res.status(500).json({ error: 'Failed to delete users' });
-  }
+  if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'No users selected' });
+  // NOTA BENE: Hard delete — permanent removal
+  await pool.query('DELETE FROM users WHERE id = ANY($1::int[])', [ids]);
+  res.json({ message: `${ids.length} user(s) deleted successfully` });
 });
 
-
 app.delete('/api/users/unverified', requireAuth, async (req, res) => {
-  try {
-    const result = await pool.query(`DELETE FROM users WHERE status = 'unverified' RETURNING id`);
-    res.json({ message: `${result.rows.length} unverified user(s) deleted` });
-  } catch (err) {
-    console.error('Delete unverified error:', err);
-    res.status(500).json({ error: 'Failed to delete unverified users' });
-  }
+  const result = await pool.query(`DELETE FROM users WHERE status = 'unverified' RETURNING id`);
+  res.json({ message: `${result.rows.length} unverified user(s) deleted` });
 });
 
 initDb().then(() => {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-}).catch(err => {
-  console.error('Failed to initialize database:', err);
-  process.exit(1);
-});
+}).catch(err => { console.error('DB init failed:', err); process.exit(1); });
