@@ -1,4 +1,3 @@
-// IMPORTANT: Main server — JWT-based auth (no session store needed)
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
@@ -11,13 +10,12 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.SESSION_SECRET || 'dev-secret';
 
-// IMPORTANT: PostgreSQL connection pool
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-// IMPORTANT: Initialize database schema on startup
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -36,16 +34,18 @@ async function initDb() {
   console.log('Database initialized with unique index on email');
 }
 
-// NOTE: Nodemailer — Gmail SMTP
+
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
   },
 });
 
-// NOTE: Fire-and-forget email — registration never blocks on this
+
 function sendVerificationEmailAsync(email, name, token) {
   const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
   const link = `${baseUrl}/api/verify?token=${token}`;
@@ -63,16 +63,14 @@ app.use(cors({
   credentials: true,
 }));
 
-// IMPORTANT: JWT auth middleware — checks token from Authorization header
 async function requireAuth(req, res, next) {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
+  const token = authHeader && authHeader.split(' ')[1]; 
   if (!token) {
     return res.status(401).json({ error: 'Not authenticated' });
   }
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    // NOTE: Check user still exists and is not blocked on every request
     const result = await pool.query('SELECT id, status FROM users WHERE id = $1', [decoded.userId]);
     if (result.rows.length === 0) {
       return res.status(401).json({ error: 'User not found', redirect: true });
@@ -97,7 +95,6 @@ app.post('/api/register', async (req, res) => {
   try {
     const passwordHash = await bcrypt.hash(password, 10);
     const token = uuidv4();
-    // IMPORTANT: No code check for duplicate email — unique index handles it
     const result = await pool.query(
       `INSERT INTO users (name, email, password_hash, status, verification_token, created_at)
        VALUES ($1, $2, $3, 'unverified', $4, NOW())
@@ -110,7 +107,6 @@ app.post('/api/register', async (req, res) => {
       user: result.rows[0],
     });
   } catch (err) {
-    // NOTA BENE: PostgreSQL unique constraint violation code
     if (err.code === '23505') {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
@@ -138,7 +134,6 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
-    // NOTE: Sign JWT with 24h expiry
     const jwtToken = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '24h' });
     res.json({
       token: jwtToken,
@@ -151,7 +146,6 @@ app.post('/api/login', async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-  // NOTE: JWT is stateless — logout is handled client-side by deleting the token
   res.json({ message: 'Logged out successfully' });
 });
 
@@ -177,8 +171,6 @@ app.get('/api/me', requireAuth, async (req, res) => {
 });
 
 // ── USER MANAGEMENT ROUTES ────────────────────────────────────────────────────
-
-// IMPORTANT: getUniqIdValue — returns unique id for a user row
 function getUniqIdValue(user) { return user.id; }
 
 app.get('/api/users', requireAuth, async (req, res) => {
@@ -203,7 +195,6 @@ app.post('/api/users/unblock', requireAuth, async (req, res) => {
 app.delete('/api/users', requireAuth, async (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'No users selected' });
-  // NOTA BENE: Hard delete — permanent removal
   await pool.query('DELETE FROM users WHERE id = ANY($1::int[])', [ids]);
   res.json({ message: `${ids.length} user(s) deleted successfully` });
 });
