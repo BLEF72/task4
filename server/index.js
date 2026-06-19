@@ -1,4 +1,3 @@
-// IMPORTANT: Main server — JWT-based auth (no session store needed)
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
@@ -11,13 +10,13 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.SESSION_SECRET || 'dev-secret';
 
-// IMPORTANT: PostgreSQL connection pool
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-// IMPORTANT: Initialize database schema on startup
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -36,16 +35,18 @@ async function initDb() {
   console.log('Database initialized with unique index on email');
 }
 
-// NOTE: Nodemailer — Gmail SMTP
+
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
   },
 });
 
-// NOTE: Fire-and-forget email — registration never blocks on this
+
 function sendVerificationEmailAsync(email, name, token) {
   const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
   const link = `${baseUrl}/api/verify?token=${token}`;
@@ -63,7 +64,6 @@ app.use(cors({
   credentials: true,
 }));
 
-// IMPORTANT: JWT auth middleware — checks token from Authorization header
 async function requireAuth(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
@@ -87,7 +87,6 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// ── AUTH ROUTES ───────────────────────────────────────────────────────────────
 
 app.post('/api/register', async (req, res) => {
   const { name, email, password } = req.body;
@@ -97,7 +96,7 @@ app.post('/api/register', async (req, res) => {
   try {
     const passwordHash = await bcrypt.hash(password, 10);
     const token = uuidv4();
-    // IMPORTANT: No code check for duplicate email — unique index handles it
+ 
     const result = await pool.query(
       `INSERT INTO users (name, email, password_hash, status, verification_token, created_at)
        VALUES ($1, $2, $3, 'unverified', $4, NOW())
@@ -151,7 +150,6 @@ app.post('/api/login', async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-  // NOTE: JWT is stateless — logout is handled client-side by deleting the token
   res.json({ message: 'Logged out successfully' });
 });
 
@@ -178,7 +176,6 @@ app.get('/api/me', requireAuth, async (req, res) => {
 
 // ── USER MANAGEMENT ROUTES ────────────────────────────────────────────────────
 
-// IMPORTANT: getUniqIdValue — returns unique id for a user row
 function getUniqIdValue(user) { return user.id; }
 
 app.get('/api/users', requireAuth, async (req, res) => {
